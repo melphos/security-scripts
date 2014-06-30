@@ -45,13 +45,18 @@ declare -i portscan=$UNKNOWN sshscan=$UNKNOWN sslscan=$UNKNOWN
 declare -i trace=$UNKNOWN whois=$UNKNOWN webscan=$UNKNOWN
 
 # defaults
+declare cipherscan=/usr/local/bin/cipherscan/cipherscan
+declare openssl=/usr/local/bin/openssl/apps/openssl
+[[ ! -e $openssl ]] && openssl=$(which openssl)
 declare -i loglevel=$STDOUT
 declare -i timeout=30
 declare webports=80,443
+
 # 465: SMTP/ssl
 # 993: IMAP/ssl
 # 995: POP/ssl
-declare sslports=443,465,993,995
+# 3389: RDP
+declare sslports=443,465,993,995,3389
 
 # statuses
 declare -i hoststatus=$UNKNOWN portstatus=$UNKNOWN
@@ -75,6 +80,12 @@ prettyprint() {
     else
         echo "$1"
     fi
+    [[ -z $nocolor ]] && tput sgr0
+}
+
+err() {
+    [[ -z $nocolor ]] && echo -ne $RED
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Error: $1" >&2
     [[ -z $nocolor ]] && tput sgr0
 }
 
@@ -108,7 +119,7 @@ usage() {
     echo "     --ports             nmap portscan (all ports)"
     echo " -s                      check SSL configuration"
     echo "     --ssl               perform all SSL configuration checks"
-    echo "     --timeout=SECONDS   change timeout for sslscan (default=$timeout)"
+    echo "     --timeout=SECONDS   change timeout for ciphercan (default=$timeout)"
     echo "     --ssh               perform SSH configuration checks"
     echo " -t                      check webserver for HTTP TRACE method"
     echo "     --trace             perform all HTTP TRACE method checks"
@@ -147,14 +158,15 @@ usage() {
 
 # setlogfilename (name)
 # sets the GLOBAL variable logfile and tool
+# also checks whether tool exists
 setlogfilename() {
-    logfile=$workdir/${target}_$1_${datestring}.txt
     if type $1 >/dev/null 2>&1; then
         tool=$1
     else
-        showstatus "ERROR: The program $1 could not be found" $RED
+        err "The program $1 could not be found"
         tool=$ERROR
     fi
+    logfile=$workdir/${target}_$1_${datestring}.txt
 }
 
 # purgelogs logfile [LOGLEVEL]
@@ -267,7 +279,7 @@ version() {
     echo ""
     nmap -V
     echo ""
-    sslscan --version|sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g"
+    $openssl version -a|sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g"
     echo ""
     prettyprint "$NAME version $VERSION" $BLUE
     prettyprint "      (c) 2013-2014 Peter Mosmans [Go Forward]" $LIGHTBLUE
@@ -396,7 +408,7 @@ do_sshscan() {
 }
 
 do_sslscan() {
-    setlogfilename "sslscan"
+    setlogfilename $cipherscan
     if (($sslscan>=$BASIC)) && (($tool!=$ERROR)); then
        for port in ${sslports//,/ }; do
            checkifportopen $port
@@ -404,18 +416,13 @@ do_sslscan() {
                showstatus "port $port closed" $BLUE
                return
            fi
-           showstatus "performing sslscan on $target port $port..." $NONEWLINE
-           timeout $timeout sslscan --no-failed $target:$port|sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g" > $logfile || portstatus=$ERROR
-           if [[ -s $logfile ]] ; then
-               grep -qe "ERROR: Could not open a connection to host" $logfile&&portstatus=$ERROR
-           else
-               portstatus=$ERROR
-           fi
-           if (($portstatus==$ERROR)) ; then
+           showstatus "performing cipherscan on $target port $port..." $NONEWLINE
+           timeout $timeout $cipherscan -o $openssl $target:$port|awk '/^[0-9]/{print $2,$3}' 1> $logfile 2>/dev/null || portstatus=$ERROR
+           if [[ ! -s $logfile ]] ; then
                showstatus "could not connect" $BLUE
            else
                showstatus ""
-               showstatus "$(awk '/(Accepted).*(ADH|RC4|IDEA|SSLv2|EXP|MD5|NULL| 40| 56)/{print $2,$3,$4,$5}' $logfile)" $RED
+               showstatus "$(awk '/(ADH|RC4|IDEA|SSLv2|EXP|MD5|NULL| 40| 56)/{print $1,$2}' $logfile)" $RED
            fi
            purgelogs
        done
@@ -424,7 +431,7 @@ do_sslscan() {
     if (($sslscan>=$ADVANCED)); then
         showstatus "performing nmap sslscan on $target ports $sslports..."
         setlogfilename "nmap"
-        nmap -p $sslports --script ssl-enum-ciphers --script ssl-heartbleed --open -oN $logfile $target 1>/dev/null 2>&1 </dev/null
+        nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open -oN $logfile $target 1>/dev/null 2>&1 </dev/null
         if [[ -s $logfile ]] ; then
             showstatus "$(awk '/( - )(broken|weak|unknown)/{print $2}' $logfile)" $RED
         else
@@ -649,7 +656,7 @@ while [[ $# -gt 0 ]]; do
         -i|--inputfile) inputfile="$2"
             [[ ! $inputfile =~ ^/ ]] && inputfile=$(pwd)/$inputfile
             if [[ ! -s "$inputfile" ]]; then
-                echo "error: cannot find $inputfile" 
+                err "cannot find $inputfile"
                 exit 1
             fi           
             shift ;;
@@ -706,7 +713,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ! type nmap >/dev/null 2>&1; then
-    prettyprint "ERROR: the program nmap is needed but could not be found" $RED
+    err "the program nmap is needed but could not be found"
     exit
 fi
 
