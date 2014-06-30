@@ -161,7 +161,7 @@ usage() {
 # also checks whether tool exists
 setlogfilename() {
     if type $1 >/dev/null 2>&1; then
-        tool=$1
+        tool=$(basename $1)
     else
         err "The program $1 could not be found"
         tool=$ERROR
