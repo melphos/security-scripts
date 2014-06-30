@@ -156,11 +156,16 @@ usage() {
     echo ""
 }
 
-# setlogfilename (name)
-# sets the GLOBAL variable logfile and tool
-# also checks whether tool exists
+################################################################################
+# Checks if tool_name exists and sets GLOBAL variables
+#
+# Arguments: 1 tool_name
+#
+# Changes the following GLOBAL variables: 1 logfile
+#                                         2 tool
+################################################################################
 setlogfilename() {
-    if type $1 >/dev/null 2>&1; then
+    if [[ -s $1 ]]; then
         tool=$(basename $1)
     else
         err "The program $1 could not be found"
