@@ -47,7 +47,7 @@ declare -i trace=$UNKNOWN whois=$UNKNOWN webscan=$UNKNOWN
 
 # defaults
 declare cipherscan=/usr/local/bin/cipherscan/cipherscan
-declare nmap="nmap"
+declare nmap=$(which nmap)
 declare openssl="openssl"
 #[[ ! -e $openssl ]] && openssl=$(which openssl)
 declare -i loglevel=$STDOUT
@@ -131,8 +131,8 @@ usage() {
     echo "     --fingerprint       perform all web fingerprinting methods"
     echo " -h, --header            show webserver headers (all webports)"
     echo " -n, --nikto             nikto webscan (all webports)"
-    echo " -p                      nmap portscan (top 1000 ports)"
-    echo "     --ports             nmap portscan (all ports)"
+    echo " -p                      nmap portscan (top 1000 TCP ports)"
+    echo "     --ports             nmap portscan (all ports, TCP and UDP)"
     echo " -s                      check SSL configuration"
     echo "     --ssl               perform all SSL configuration checks"
     echo "     --sslcert           show details of SSL certificate"
@@ -273,7 +273,7 @@ do_update() {
         purgelogs
         exit 0
     else
-        showstatus "Sorry, this doesn't seem to be a git archive"
+        showstatus "Sorry, this doesn't seem to be a git repository"
         showstatus "Please clone the repository using the following command: "
         showstatus "git clone https://github.com/PeterMosmans/security-scripts.git"
     fi;
@@ -400,7 +400,7 @@ do_portscan() {
         $nmap --open -p- -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
     else
         showstatus "performing nmap portscan... " $NONEWLINE
-        $nmap --open -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
+        $nmap --open -sS -sU -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
     fi
     grep -q "0 hosts up" $portselection || hoststatus=$UP
     if (($hoststatus<$UP)); then
@@ -461,7 +461,7 @@ do_sslscan() {
                showstatus "port $port closed" $BLUE
                return
            fi
-           showstatus "performing cipherscan on $target port $port..." $NONEWLINE
+           showstatus "performing cipherscan on $target port $port... " $NONEWLINE
            execute_command "$cipherscan -o $openssl $target:$port" $logfile '/^[0-9]/{print $2,$3}'
            if [[ -s $logfile ]] ; then
                showstatus ""
@@ -470,55 +470,61 @@ do_sslscan() {
                showstatus "could not connect" $BLUE
            fi
            purgelogs
+           parse_cert $target $port
        done
     fi
+    purgelogs
 
     setlogfilename $nmap
     if (($sslscan>=$ADVANCED)) && [[ $tool != $ERROR ]]; then
-        showstatus "performing nmap sslscan on $target ports $sslports..."
-        execute_command "$nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open $target -oN $logfile" $logfile '/!^#/'
+        showstatus "performing nmap sslscan on $target ports $sslports... "
+        execute_command "$nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open $target -oN $logfile" /dev/null '/!^#/'
         if [[ -s $logfile ]] ; then
             showstatus "$(awk '/( - )(broken|weak|unknown)/{print $2}' $logfile)" $RED
         else
             showstatus "could not connect to $target ports $sslports" $BLUE
         fi
-        purgelogs
     fi
+    purgelogs
+}
 
+################################################################################
+# Obtains a x.509 certificate and shows whether the dates are valid
+#
+# Arguments: 1 target
+#            2 port
+################################################################################
+parse_cert() {
+    local target=$1
+    local port=$2
     setlogfilename $openssl
-    if (($sslscan>=$ALTERNATIVE)); then
-        showstatus "obtaining SSL x.509 certificate..."
+    if [[ "$tool" != "$ERROR" ]]; then
+        showstatus "trying to retrieve SSL x.509 certificate on ${target}:${port}... " $NONEWLINE
         #        certificate=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
-                certificate=$(mktemp -q $NAME.XXXXXXX)
-                for port in ${sslports//,/ }; do
-            checkifportopen $port
-            if (($portstatus==$ERROR)); then
-                showstatus "port $port closed" $BLUE
-#                return
-            fi
-            echo $openssl s_client -connect $target:$port
-            echo Q | $openssl s_client -connect $target:$port 2>/dev/null 1>$certificate
-            if [[ -s $certificate ]]; then
-                showstatus "certificate received on $target:$port"
-                showstatus "$($openssl x509 -noout -subject -nameopt multiline -in $certificate 2>/dev/null)"
-                startdate=$($openssl x509 -noout -startdate -in $certificate 2>/dev/null|cut -d= -f 2)
-                enddate=$($openssl x509 -noout -enddate -in $certificate 2>/dev/null|cut -d= -f 2)
-                parsedstartdate=$(date --date="$startdate" +%Y%m%d)
-                parsedenddate=$(date --date="$enddate" +%Y%m%d)
-                if [[ $parsedstartdate -gt $(date +%Y%m%d) ]]; then
-                    showstatus "certificate is not valid yet, valid from ${parsedstartdate} until ${parsedenddate}" $RED
-                else
+        certificate=$(mktemp -q $NAME.XXXXXXX)
+        echo Q | $openssl s_client -connect $target:$port -servername $target 2>/dev/null 1>$certificate
+        if [[ -s $certificate ]]; then
+            showstatus "certificate received" $BLUE
+            showstatus "$($openssl x509 -noout -subject -nameopt multiline -in $certificate 2>/dev/null)"
+            startdate=$($openssl x509 -noout -startdate -in $certificate 2>/dev/null|cut -d= -f 2)
+            enddate=$($openssl x509 -noout -enddate -in $certificate 2>/dev/null|cut -d= -f 2)
+            parsedstartdate=$(date --date="$startdate" +%Y%m%d)
+            parsedenddate=$(date --date="$enddate" +%Y%m%d)
+            localizedstartdate=$(date --date="$startdate" +%d-%m-%Y)
+            localizedenddate=$(date --date="$enddate" +%d-%m-%Y)
+            if [[ $parsedstartdate -gt $(date +%Y%m%d) ]]; then
+                showstatus "certificate is not valid yet, valid from ${localizedstartdate} until ${localizedenddate}" $RED
+            else
                     if [[ $parsedenddate -lt $(date +%Y%m%d) ]]; then
-                        showstatus "certificate has expired on ${parsedenddate}" $RED
+                        showstatus "certificate has expired on ${localizedenddate}" $RED
                     else
-                        showstatus "certificate is valid between ${parsedstartdate} and ${parsedenddate}" $GREEN
+                        showstatus "certificate is valid between ${localizedstartdate} and ${localizedenddate}" $GREEN
                     fi
                 fi
-            else
-                showstatus "could not retrieve certificate on $target:$port" $RED
-            fi
-            rm -f $certificate 1>/dev/null
-        done
+        else
+            showstatus "failed" $RED
+        fi
+        rm -f $certificate 1>/dev/null
     fi
     purgelogs
 }
@@ -690,7 +696,7 @@ abortscan() {
 
 cleanup() {
     trap '' EXIT INT QUIT
-    if [[ ! -z $tool ]] && (($ERROR!=$tool)); then 
+    if [[ ! -z $tool ]] && [[ "$tool" != "$ERROR" ]]; then 
         showstatus "$tool interrupted..." $RED
         purgelogs
     fi
