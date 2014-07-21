@@ -21,7 +21,6 @@
 
 
 NAME="analyze_hosts"
-VERSION="0.85 (16-06-2014)"
 
 # statuses
 declare ERROR=-1
@@ -34,10 +33,12 @@ declare ALTERNATIVE=4
 declare NOLOGFILE=-1
 declare QUIET=1
 declare STDOUT=2
+# Error messages are shown when VERBOSE
 declare VERBOSE=4
 declare LOGFILE=8
 declare RAWLOGS=16
 declare SEPARATELOGS=32
+declare COMMAND=64
 
 # scantypes
 declare -i dnstest=$UNKNOWN fingerprint=$UNKNOWN nikto=$UNKNOWN
@@ -46,16 +47,12 @@ declare -i trace=$UNKNOWN whois=$UNKNOWN webscan=$UNKNOWN
 
 # defaults
 declare cipherscan=/usr/local/bin/cipherscan/cipherscan
-declare openssl=/usr/local/bin/openssl/apps/openssl
-[[ ! -e $openssl ]] && openssl=$(which openssl)
+declare nmap="nmap"
+declare openssl="openssl"
+#[[ ! -e $openssl ]] && openssl=$(which openssl)
 declare -i loglevel=$STDOUT
 declare -i timeout=30
 declare webports=80,443
-
-# 465: SMTP/ssl
-# 993: IMAP/ssl
-# 995: POP/ssl
-# 3389: RDP
 declare sslports=443,465,993,995,3389
 
 # statuses
@@ -68,10 +65,17 @@ declare BLUE='\E[1;49;96m' LIGHTBLUE='\E[2;49;96m'
 declare RED='\E[1;49;31m' LIGHTRED='\E[2;49;31m'
 declare GREEN='\E[1;49;32m' LIGHTGREEN='\E[2;49;32m'
 
-trap abortscan INT
-trap cleanup QUIT
+################################################################################
+### Functions ##################################################################
+################################################################################
 
-# define functions
+################################################################################
+# prints text on screen in color
+#
+# Arguments: 1 text
+#            2 color
+#           [3 $NONEWLINE]
+################################################################################
 prettyprint() {
     (($loglevel&$QUIET)) && return
     [[ -z $nocolor ]] && echo -ne $2
@@ -83,10 +87,21 @@ prettyprint() {
     [[ -z $nocolor ]] && tput sgr0
 }
 
+################################################################################
+# Shows error message and, if supplied, logfile containing the error
+#
+# Arguments: 1 errorstring
+#           [2 filename]
+################################################################################
 err() {
-    [[ -z $nocolor ]] && echo -ne $RED
-    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] Error: $1" >&2
-    [[ -z $nocolor ]] && tput sgr0
+    if [[ $loglevel -gt $VERBOSE ]]; then
+        local errorstring=$1
+        local filename=$2
+        [[ -z $nocolor ]] && echo -ne $RED
+        [[ $loglevel -gt $VERBOSE ]] && echo "[$(date +'%H:%M:%S')] Error: $errorstring" >&2
+        [[ -z $nocolor ]] && tput sgr0
+        [[ -s $filename ]] && cat $filename
+    fi
 }
 
 usage() {
@@ -108,7 +123,8 @@ usage() {
     echo "Scanning options:"
     echo " -a, --all               perform all basic scans" 
     echo "     --max               perform all advanced scans (more thorough)" 
-    echo " -b, --basic             perform basic scans (fingerprint, ssl, trace)" 
+    echo " -b, --basic             perform basic scans (fingerprint, ssl, trace)"
+    echo " -c                      print command to be executed"
     echo "                         results of HOST matches regexp FILTER"
     echo "     --dns               test for recursive query"
     echo " -f                      perform web fingerprinting (all webports)"
@@ -119,6 +135,7 @@ usage() {
     echo "     --ports             nmap portscan (all ports)"
     echo " -s                      check SSL configuration"
     echo "     --ssl               perform all SSL configuration checks"
+    echo "     --sslcert           show details of SSL certificate"
     echo "     --timeout=SECONDS   change timeout for ciphercan (default=$timeout)"
     echo "     --ssh               perform SSH configuration checks"
     echo " -t                      check webserver for HTTP TRACE method"
@@ -158,20 +175,20 @@ usage() {
 
 ################################################################################
 # Checks if tool_name exists and sets GLOBAL variables
-#
+# Should always be concluded with a purgelogs
 # Arguments: 1 tool_name
 #
 # Changes the following GLOBAL variables: 1 logfile
 #                                         2 tool
 ################################################################################
 setlogfilename() {
-    if [[ -s $1 ]]; then
+    if [[ ! -z $1 ]] && type $1 >/dev/null 2>&1; then
         tool=$(basename $1)
+        logfile=$workdir/${target}_${tool}_${datestring}.txt
     else
         err "The program $1 could not be found"
         tool=$ERROR
     fi
-    logfile=$workdir/${target}_$1_${datestring}.txt
 }
 
 # purgelogs logfile [LOGLEVEL]
@@ -282,7 +299,7 @@ version() {
     echo ""
     nikto -Version
     echo ""
-    nmap -V
+    $nmap -V
     echo ""
     $openssl version -a|sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g"
     echo ""
@@ -380,10 +397,10 @@ do_portscan() {
     hoststatus=$UNKNOWN
     if (($portscan>=$ADVANCED)); then
         showstatus "performing advanced nmap portscan (all ports)... " $NONEWLINE
-        nmap --open -p- -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
+        $nmap --open -p- -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
     else
         showstatus "performing nmap portscan... " $NONEWLINE
-        nmap --open -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
+        $nmap --open -sV -sC -oN $logfile -oG $portselection $target 1>/dev/null 2>&1 </dev/null
     fi
     grep -q "0 hosts up" $portselection || hoststatus=$UP
     if (($hoststatus<$UP)); then
@@ -396,11 +413,11 @@ do_portscan() {
 
 do_sshscan() {
     if (($sshscan>=$BASIC)); then
-        setlogfilename "nmap"
+        setlogfilename $nmap
         local portstatus=$UNKNOWN
         local ports=22
         showstatus "trying nmap SSH scan on $target port $ports... " $NONEWLINE
-        nmap -Pn -p $ports --open --script banner.nse,sshv1.nse,ssh-hostkey.nse,ssh2-enum-algos.nse -oN $logfile $target 1>/dev/null 2>&1 </dev/null
+        $nmap -Pn -p $ports --open --script banner.nse,sshv1.nse,ssh-hostkey.nse,ssh2-enum-algos.nse -oN $logfile $target 1>/dev/null 2>&1 </dev/null
         grep -q " open " $logfile && portstatus=$OPEN
         if (($portstatus<$OPEN)); then
             showstatus "port closed" $BLUE
@@ -412,9 +429,32 @@ do_sshscan() {
     fi
 }
 
+################################################################################
+# Executes command [and pre-filters the result using awk]
+#
+# Arguments: 1 command
+#           [2 output_file]
+#           [2 awk_command]
+################################################################################
+execute_command() {
+    local command=$1
+    local output=${2:-/dev/null}
+    local filter=$3
+    # TODO: check if command should be executed, displayed or both
+    (($loglevel&$COMMAND)) && echo "executing ${command}"
+    timeout $timeout $command 1> $output 2>/dev/null || err "executing $command"
+    if [[ ! -z $filter ]] && [[ -s $output ]]; then
+        #        full_result=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
+        full_result=$(mktemp -q $NAME.XXXXXXX)
+        mv -f $output $full_result
+        awk "${filter}" $full_result > $output
+        rm -f $full_result
+    fi
+}
+
 do_sslscan() {
     setlogfilename $cipherscan
-    if (($sslscan>=$BASIC)) && (($tool!=$ERROR)); then
+    if (($sslscan>=$BASIC)) && [[ $tool != $ERROR ]]; then
        for port in ${sslports//,/ }; do
            checkifportopen $port
            if (($portstatus==$ERROR)); then
@@ -422,21 +462,21 @@ do_sslscan() {
                return
            fi
            showstatus "performing cipherscan on $target port $port..." $NONEWLINE
-           timeout $timeout $cipherscan -o $openssl $target:$port|awk '/^[0-9]/{print $2,$3}' 1> $logfile 2>/dev/null || portstatus=$ERROR
-           if [[ ! -s $logfile ]] ; then
-               showstatus "could not connect" $BLUE
-           else
+           execute_command "$cipherscan -o $openssl $target:$port" $logfile '/^[0-9]/{print $2,$3}'
+           if [[ -s $logfile ]] ; then
                showstatus ""
                showstatus "$(awk '/(ADH|RC4|IDEA|SSLv2|EXP|MD5|NULL| 40| 56)/{print $1,$2}' $logfile)" $RED
+           else
+               showstatus "could not connect" $BLUE
            fi
            purgelogs
        done
     fi
 
-    if (($sslscan>=$ADVANCED)); then
+    setlogfilename $nmap
+    if (($sslscan>=$ADVANCED)) && [[ $tool != $ERROR ]]; then
         showstatus "performing nmap sslscan on $target ports $sslports..."
-        setlogfilename "nmap"
-        nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open -oN $logfile $target 1>/dev/null 2>&1 </dev/null
+        execute_command "$nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open $target -oN $logfile" $logfile '/!^#/'
         if [[ -s $logfile ]] ; then
             showstatus "$(awk '/( - )(broken|weak|unknown)/{print $2}' $logfile)" $RED
         else
@@ -444,6 +484,43 @@ do_sslscan() {
         fi
         purgelogs
     fi
+
+    setlogfilename $openssl
+    if (($sslscan>=$ALTERNATIVE)); then
+        showstatus "obtaining SSL x.509 certificate..."
+        #        certificate=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
+                certificate=$(mktemp -q $NAME.XXXXXXX)
+                for port in ${sslports//,/ }; do
+            checkifportopen $port
+            if (($portstatus==$ERROR)); then
+                showstatus "port $port closed" $BLUE
+#                return
+            fi
+            echo $openssl s_client -connect $target:$port
+            echo Q | $openssl s_client -connect $target:$port 2>/dev/null 1>$certificate
+            if [[ -s $certificate ]]; then
+                showstatus "certificate received on $target:$port"
+                showstatus "$($openssl x509 -noout -subject -nameopt multiline -in $certificate 2>/dev/null)"
+                startdate=$($openssl x509 -noout -startdate -in $certificate 2>/dev/null|cut -d= -f 2)
+                enddate=$($openssl x509 -noout -enddate -in $certificate 2>/dev/null|cut -d= -f 2)
+                parsedstartdate=$(date --date="$startdate" +%Y%m%d)
+                parsedenddate=$(date --date="$enddate" +%Y%m%d)
+                if [[ $parsedstartdate -gt $(date +%Y%m%d) ]]; then
+                    showstatus "certificate is not valid yet, valid from ${parsedstartdate} until ${parsedenddate}" $RED
+                else
+                    if [[ $parsedenddate -lt $(date +%Y%m%d) ]]; then
+                        showstatus "certificate has expired on ${parsedenddate}" $RED
+                    else
+                        showstatus "certificate is valid between ${parsedstartdate} and ${parsedenddate}" $GREEN
+                    fi
+                fi
+            else
+                showstatus "could not retrieve certificate on $target:$port" $RED
+            fi
+            rm -f $certificate 1>/dev/null
+        done
+    fi
+    purgelogs
 }
 
 do_trace() {
@@ -475,9 +552,9 @@ do_trace() {
     fi
 
     if (($trace>=$ADVANCED)); then
-        setlogfilename "nmap"
+        setlogfilename $nmap
         showstatus "trying nmap TRACE method on ports $webports... " $NONEWLINE
-        nmap -p$webports --open --script http-trace -oN $logfile $target 1>/dev/null 2>&1 </dev/null
+        $nmap -p$webports --open --script http-trace -oN $logfile $target 1>/dev/null 2>&1 </dev/null
 	if [[ -s $logfile ]]; then
             status="$(awk '{FS="/";a[++i]=$1}/TRACE is enabled/{print "TRACE enabled on port "a[NR-1]}' $logfile)"
             if [[ -z "$status" ]]; then
@@ -520,7 +597,8 @@ do_webscan() {
 }
 
 execute_all() {
-    portselection=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
+    #    portselection=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
+        portselection=$(mktemp -q $NAME.XXXXXXX)
     if (($whois>=$BASIC)); then
         local nomatch=
         local ip=
@@ -625,8 +703,15 @@ cleanup() {
     exit
 }
 
+################################################################################
+### Main program ###############################################################
+################################################################################
+
+trap abortscan INT
+trap cleanup QUIT
+
 which tput 1>/dev/null 2>&1 || nocolor=TRUE
-if ! options=$(getopt -o ad:fhi:lno:pqstuvwWy -l dns,directory:,filter:,fingerprint,header,inputfile:,log,max,nikto,nocolor,output:,ports,quiet,ssh,ssl,sslports:,timeout:,trace,update,version,webports:,whois,wordlist: -- "$@") ; then
+if ! options=$(getopt -s bash -o acd:fhi:lno:pqstuvwWy -l dns,directory:,filter:,fingerprint,header,inputfile:,log,max,nikto,nocolor,output:,ports,quiet,ssh,ssl,sslcert,sslports:,timeout:,trace,update,version,webports:,whois,wordlist: -- "$@") ; then
     usage
     exit 1
 fi 
@@ -650,6 +735,7 @@ while [[ $# -gt 0 ]]; do
             whois=$BASIC;;
         --allports) portscan=$ADVANCED;;
         --dns) dnstest=$ADVANCED;;
+        -c) let "loglevel=loglevel|$COMMAND";;
         -f) fingerprint=$BASIC;;
         --fingerprint) fingerprint=$ADVANCED;;
         -h|--header) fingerprint=$ALTERNATIVE;;
@@ -694,6 +780,7 @@ while [[ $# -gt 0 ]]; do
         -s) sslscan=$BASIC;;
         --ssh) sshscan=$BASIC;;
         --ssl) sslscan=$ADVANCED;;
+        --sslcert) sslscan=$ALTERNATIVE;;
         -t) trace=$BASIC;;
         --timeout) timeout=$2
             shift ;;
@@ -717,10 +804,10 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-if ! type nmap >/dev/null 2>&1; then
-    err "the program nmap is needed but could not be found"
-    exit
-fi
+#if ! type $nmap >/dev/null 2>&1; then
+#    err "the program nmap is needed but could not be found"
+#    exit
+#fi
 
 if [[ ! -s "$inputfile" ]]; then
     if [[ ! -n "$1" ]]; then
@@ -733,7 +820,7 @@ if [[ ! -s "$inputfile" ]]; then
     fi
     tmpfile=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
     if [[ $1 =~ -.*[0-9]$ ]]; then
-        nmap -nsL $1 2>/dev/null|awk '/scan report/{print $5}' >$tmpfile
+        $nmap -nsL $1 2>/dev/null|awk '/scan report/{print $5}' >$tmpfile
         inputfile=$tmpfile
     fi
     if [[ $1 =~ , ]]; then
