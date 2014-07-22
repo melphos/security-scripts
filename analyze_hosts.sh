@@ -51,7 +51,8 @@ declare nmap=$(which nmap)
 declare openssl="openssl"
 #[[ ! -e $openssl ]] && openssl=$(which openssl)
 declare -i loglevel=$STDOUT
-declare -i timeout=30
+declare -i timeout=120
+declare -i ssltimeout=5
 declare webports=80,443
 declare sslports=443,465,993,995,3389
 
@@ -239,26 +240,47 @@ showstatus() {
     fi
 }
 
+################################################################################
+# read version info into global variables
+#
+# GLOBALS: realpath
+#          branch
+#          commit
+#          versionstring
+################################################################################
+read_version() {
+    realpath=$(dirname $(readlink -f $0))
+    branch="unknown"
+    commit="unknown"
+    if [[ -d $realpath/.git ]]; then
+        setlogfilename "git"
+        if (($tool!=$ERROR)); then
+            pushd $realpath 1>/dev/null 2>&1
+            branch=$(git rev-parse --abbrev-ref HEAD)
+            commit=$(git rev-parse --short=4 HEAD)
+            versionstring="${branch} branch (commit ${commit})"
+            popd 1>/dev/null 2>&1
+        fi
+        purgelogs
+    else
+        versionstring="unknown"
+    fi
+}
+
 do_update() {
-    local realpath=$(dirname $(readlink -f $0))
-    local branch="unkown"
-    local commit="unknown"
     if [[ -d $realpath/.git ]]; then
         setlogfilename "git"
         if (($tool!=$ERROR)); then
             local status=$UNKNOWN
             pushd $realpath 1>/dev/null 2>&1
-            branch=$(git rev-parse --abbrev-ref HEAD)
-            commit=$(git log|head -1|awk '{print $2}'|cut -c -10)
-            showstatus "current version: $VERSION (${branch} branch commit ${commit})"
+            showstatus "current version: ${versionstring}"
             if [[ ! -z "$1" ]]; then
                 showstatus "forcing update, overwriting local changes"
-                git fetch origin master 1>$logfile 2>&1
                 git reset --hard FETCH_HEAD 1>>$logfile 2>&1
             else
                 git pull 1>$logfile 2>&1
             fi
-            commit=$(git log|head -1|awk '{print $2}'|cut -c -10)
+            read_version
             grep -Eq "error: |Permission denied" $logfile && status=$ERROR
             grep -q "Already up-to-date." $logfile && status=$OPEN
             popd 1>/dev/null 2>&1
@@ -267,7 +289,7 @@ do_update() {
         fi
         case $status in
             $ERROR) showstatus "error updating $0" $RED;;
-            $UNKNOWN) showstatus "succesfully updated to $(awk '{FS="\""}/^VERSION=/{print $2}' $0) (commit ${commit})" $GREEN;;
+            $UNKNOWN) showstatus "succesfully updated to ${versionstring}" $GREEN;;
             $OPEN) showstatus "already running latest version" $BLUE;;
         esac
         purgelogs
@@ -276,13 +298,14 @@ do_update() {
         showstatus "Sorry, this doesn't seem to be a git repository"
         showstatus "Please clone the repository using the following command: "
         showstatus "git clone https://github.com/PeterMosmans/security-scripts.git"
-    fi;
+    fi
 }
 
 startup() {
     flag=$OPEN
     trap cleanup EXIT
-    showstatus "$NAME version $VERSION starting on $(date +%d-%m-%Y' at '%R)"
+    read_version
+    showstatus "$NAME version ${versionstring} starting on $(date +%d-%m-%Y' at '%R)"
     if (($loglevel&$LOGFILE)); then
         if [[ -n $appendfile ]]; then
             showstatus "appending to existing file $outputfile"
@@ -303,7 +326,7 @@ version() {
     echo ""
     $openssl version -a|sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g"
     echo ""
-    prettyprint "$NAME version $VERSION" $BLUE
+    prettyprint "$NAME version ${versionstring}" $BLUE
     prettyprint "      (c) 2013-2014 Peter Mosmans [Go Forward]" $LIGHTBLUE
     prettyprint "      Licensed under the Mozilla Public License 2.0" $LIGHTBLUE
     echo ""
@@ -441,7 +464,7 @@ execute_command() {
     local output=${2:-/dev/null}
     local filter=$3
     # TODO: check if command should be executed, displayed or both
-    (($loglevel&$COMMAND)) && echo "executing ${command}"
+    (($loglevel&$COMMAND)) && showstatus "executing"; showstatus "${command}"
     timeout $timeout $command 1> $output 2>/dev/null || err "executing $command"
     if [[ ! -z $filter ]] && [[ -s $output ]]; then
         #        full_result=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
@@ -453,39 +476,51 @@ execute_command() {
 }
 
 do_sslscan() {
-    setlogfilename $cipherscan
-    if (($sslscan>=$BASIC)) && [[ $tool != $ERROR ]]; then
-       for port in ${sslports//,/ }; do
-           checkifportopen $port
-           if (($portstatus==$ERROR)); then
-               showstatus "port $port closed" $BLUE
-               return
-           fi
-           showstatus "performing cipherscan on $target port $port... " $NONEWLINE
-           execute_command "$cipherscan -o $openssl $target:$port" $logfile '/^[0-9]/{print $2,$3}'
-           if [[ -s $logfile ]] ; then
-               showstatus ""
-               showstatus "$(awk '/(ADH|RC4|IDEA|SSLv2|EXP|MD5|NULL| 40| 56)/{print $1,$2}' $logfile)" $RED
-           else
-               showstatus "could not connect" $BLUE
-           fi
-           purgelogs
-           parse_cert $target $port
-       done
-    fi
-    purgelogs
-
-    setlogfilename $nmap
-    if (($sslscan>=$ADVANCED)) && [[ $tool != $ERROR ]]; then
-        showstatus "performing nmap sslscan on $target ports $sslports... "
-        execute_command "$nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open $target -oN $logfile" /dev/null '/!^#/'
-        if [[ -s $logfile ]] ; then
-            showstatus "$(awk '/( - )(broken|weak|unknown)/{print $2}' $logfile)" $RED
-        else
-            showstatus "could not connect to $target ports $sslports" $BLUE
+    # check if only a sslcert is requested
+    if (($sslscan==$ALTERNATIVE)); then
+        setlogfilename $openssl
+        if [[ $tool != $ERROR ]]; then
+            port=443
+#            for port in ${sslports//,/ }; do
+                parse_cert $target $port
+#            done
         fi
+        purgelogs
+    else
+        setlogfilename $cipherscan
+        if (($sslscan>=$BASIC)) && [[ $tool != $ERROR ]]; then
+            for port in ${sslports//,/ }; do
+                checkifportopen $port
+                if (($portstatus==$ERROR)); then
+                    showstatus "port $port closed" $BLUE
+                    return
+                fi
+                showstatus "performing cipherscan on $target port $port... " $NONEWLINE
+                execute_command "$cipherscan -o $openssl $target:$port" $logfile '/^[0-9]/{print $2,$3}'
+                if [[ -s $logfile ]] ; then
+                    showstatus ""
+                    showstatus "$(awk '/(ADH|RC4|IDEA|SSLv2|EXP|MD5|NULL| 40| 56)/{print $1,$2}' $logfile)" $RED
+                else
+                    showstatus "could not connect" $BLUE
+                fi
+                purgelogs
+                parse_cert $target $port
+            done
+        fi
+        purgelogs
+
+        setlogfilename $nmap
+        if (($sslscan>=$ADVANCED)) && [[ $tool != $ERROR ]]; then
+            showstatus "performing nmap sslscan on $target ports $sslports... "
+            execute_command "$nmap -p $sslports --script ssl-enum-ciphers,ssl-heartbleed,rdp-enum-encryption --open $target -oN $logfile" /dev/null '/!^#/'
+            if [[ -s $logfile ]] ; then
+                showstatus "$(awk '/( - )(broken|weak|unknown)/{print $2}' $logfile)" $RED
+            else
+                showstatus "could not connect to $target ports $sslports" $BLUE
+            fi
+        fi
+        purgelogs
     fi
-    purgelogs
 }
 
 ################################################################################
@@ -502,9 +537,9 @@ parse_cert() {
         showstatus "trying to retrieve SSL x.509 certificate on ${target}:${port}... " $NONEWLINE
         #        certificate=$(mktemp -q $NAME.XXXXXXX --tmpdir=$workdir)
         certificate=$(mktemp -q $NAME.XXXXXXX)
-        echo Q | $openssl s_client -connect $target:$port -servername $target 2>/dev/null 1>$certificate
+        echo Q | timeout $ssltimeout $openssl s_client -connect $target:$port -servername $target 1>$certificate 2>/dev/null
         if [[ -s $certificate ]]; then
-            showstatus "certificate received" $BLUE
+            showstatus "received" $BLUE
             showstatus "$($openssl x509 -noout -subject -nameopt multiline -in $certificate 2>/dev/null)"
             startdate=$($openssl x509 -noout -startdate -in $certificate 2>/dev/null|cut -d= -f 2)
             enddate=$($openssl x509 -noout -enddate -in $certificate 2>/dev/null|cut -d= -f 2)
@@ -783,10 +818,10 @@ while [[ $# -gt 0 ]]; do
         --sslports) sslports=$2
             shift ;;
         -q|--quiet) let "loglevel=loglevel|$QUIET";;
-        -s) sslscan=$BASIC;;
+        -s) let "sslscan=sslscan|$BASIC";;
         --ssh) sshscan=$BASIC;;
-        --ssl) sslscan=$ADVANCED;;
-        --sslcert) sslscan=$ALTERNATIVE;;
+        --ssl) let "sslscan=sslscan|$ADVANCED";;
+        --sslcert) let "sslscan=sslscan|$ALTERNATIVE";;
         -t) trace=$BASIC;;
         --timeout) timeout=$2
             shift ;;
